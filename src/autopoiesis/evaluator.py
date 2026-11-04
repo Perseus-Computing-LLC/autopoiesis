@@ -3,12 +3,49 @@
 from __future__ import annotations
 
 import abc
+import ast
+import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
 from autopoiesis.models import FitnessReport, MutationProposal
+
+
+def _is_trivial_test_file(test_path: Path) -> bool:
+    """Return True if a synthetic test file contains no non-trivial assertions."""
+    try:
+        tree = ast.parse(test_path.read_text(encoding="utf-8"))
+    except Exception:
+        return True
+
+    test_funcs = [
+        node for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_")
+    ]
+    if not test_funcs:
+        return True
+
+    for fn in test_funcs:
+        stmts = [
+            s for s in fn.body
+            if not (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant) and isinstance(s.value.value, str))
+        ]
+        if not stmts:
+            return True
+        non_trivial_in_fn = False
+        for s in stmts:
+            if isinstance(s, ast.Pass):
+                continue
+            if isinstance(s, ast.Assert) and isinstance(s.test, ast.Constant) and s.test.value is True:
+                continue
+            non_trivial_in_fn = True
+            break
+        if not non_trivial_in_fn:
+            return True
+    return False
 
 
 class FitnessEvaluator(abc.ABC):
@@ -38,14 +75,27 @@ class SubprocessFitnessEvaluator(FitnessEvaluator):
         self, mutation: MutationProposal, synthetic_test_paths: List[Path]
     ) -> FitnessReport:
         worktree = Path(mutation.worktree_path)
+        noop_mutation = not bool(mutation.diff.strip() or mutation.target_files)
+        trivial_challenge = (
+            not synthetic_test_paths
+            or any(_is_trivial_test_file(Path(p)) for p in synthetic_test_paths)
+        )
+
+        sub_env = os.environ.copy()
+        existing_pp = sub_env.get("PYTHONPATH", "")
+        sub_env["PYTHONPATH"] = f"{worktree}:{existing_pp}" if existing_pp else str(worktree)
+        golden_cmd = self.golden_test_cmd
+        if golden_cmd.startswith("pytest "):
+            golden_cmd = f"{sys.executable} -m {golden_cmd}"
 
         # 1. Run Golden Test Suite
         t0 = time.time()
         try:
             res_golden = subprocess.run(
-                self.golden_test_cmd,
+                golden_cmd,
                 shell=True,
                 cwd=str(worktree),
+                env=sub_env,
                 capture_output=True,
                 text=True,
                 timeout=self.timeout_seconds,
@@ -64,9 +114,9 @@ class SubprocessFitnessEvaluator(FitnessEvaluator):
         for test_path in synthetic_test_paths:
             try:
                 res_synth = subprocess.run(
-                    f"pytest -q {test_path}",
-                    shell=True,
+                    [sys.executable, "-m", "pytest", "-q", str(test_path)],
                     cwd=str(worktree),
+                    env=sub_env,
                     capture_output=True,
                     text=True,
                     timeout=self.timeout_seconds,
@@ -88,10 +138,14 @@ class SubprocessFitnessEvaluator(FitnessEvaluator):
             golden_tests_failed=golden_failed,
             synthetic_tests_passed=synthetic_passed,
             synthetic_tests_failed=synthetic_failed,
-            target_defect_rate=0.0 if synthetic_failed == 0 else 1.0,
+            target_defect_rate=0.0 if (synthetic_failed == 0 and not noop_mutation and not trivial_challenge) else 1.0,
             p95_latency_ms=latency_ms,
             memory_peak_mb=128.0,
             opsec_passed=True,
             audit_chain_valid=True,
-            details={"golden_stdout": res_golden.stdout if total_golden > 0 else ""},
+            details={
+                "golden_stdout": res_golden.stdout if total_golden > 0 else "",
+                "noop_mutation": noop_mutation,
+                "trivial_challenge": trivial_challenge,
+            },
         )

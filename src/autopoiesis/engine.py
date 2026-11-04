@@ -115,4 +115,4 @@ class AutopoiesisEngine:
 
         finally:
             if sandbox_path and sandbox_path.exists():
-                self.worktree_manager.remove_sandbox(sandbox_path)
+                self.worktree_manager.remove_sandbox(sandbox_path, branch_name=branch_name)

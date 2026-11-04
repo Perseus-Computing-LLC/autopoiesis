@@ -25,6 +25,14 @@ class ParetoGate:
     ) -> ParetoVerdict:
         rejections: List[str] = []
 
+        # 0. Non-Triviality & Non-Empty Mutation Guard
+        noop_mutation = bool(candidate_report.details.get("noop_mutation", False))
+        trivial_challenge = bool(candidate_report.details.get("trivial_challenge", False))
+        if noop_mutation:
+            rejections.append("No-op mutation: candidate diff and target_files are empty.")
+        if trivial_challenge:
+            rejections.append("Trivial curriculum: synthetic challenge test contains only constant assert True.")
+
         # 1. Zero Regression Check (Golden Suite 100% Pass)
         zero_regression = candidate_report.golden_tests_failed == 0 and candidate_report.test_pass_rate == 1.0
         if not zero_regression:
@@ -34,9 +42,12 @@ class ParetoGate:
 
         # 2. Defect Remediation Check
         defect_eliminated = (
-            candidate_report.synthetic_tests_failed == 0 and candidate_report.target_defect_rate == 0.0
+            not noop_mutation
+            and not trivial_challenge
+            and candidate_report.synthetic_tests_failed == 0
+            and candidate_report.target_defect_rate == 0.0
         )
-        if not defect_eliminated:
+        if not defect_eliminated and not noop_mutation and not trivial_challenge:
             rejections.append(
                 f"Defect not resolved: {candidate_report.synthetic_tests_failed} synthetic challenge tests failed."
             )
