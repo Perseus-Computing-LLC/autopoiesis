@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "autopoiesis"
+version = "0.1.0"
+description = "Recursive Self-Evolution Engine for Software Suites"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "Thomas Connally & Hermes Agent", email = "solutions@perseuscomputing.com" }
+]
+keywords = ["agent", "rsi", "self-improvement", "pareto", "software-evolution"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Code Generators",
+    "Topic :: Software Development :: Testing",
+]
+dependencies = [
+    "pytest>=8.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov",
+    "mypy",
+    "ruff",
+]
+
+[project.scripts]
+autopoiesis = "autopoiesis.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/autopoiesis"]
