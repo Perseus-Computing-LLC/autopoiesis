@@ -43,3 +43,7 @@ autopoiesis = "autopoiesis.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/autopoiesis"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
