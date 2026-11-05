@@ -498,5 +498,59 @@ def test_compute():
     assert res.mutation_kill_score == 1.0
 
 
+def test_git_promotion_manager_emits_attestation_card(tmp_path: Path):
+    from autopoiesis.deployment import GitPromotionManager
+    from autopoiesis.models import MutationProposal, ParetoVerdict
+
+    repo_dir = tmp_path / "mock_repo"
+    repo_dir.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=str(repo_dir), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test Agent"], cwd=str(repo_dir), check=True)
+    subprocess.run(["git", "config", "user.email", "agent@perseus.test"], cwd=str(repo_dir), check=True)
+
+    dummy_file = repo_dir / "init.txt"
+    dummy_file.write_text("initial", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=str(repo_dir), check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo_dir), check=True)
+
+    # Create worktree branch
+    wt_dir = tmp_path / "wt"
+    subprocess.run(["git", "worktree", "add", "-b", "feature-mut", str(wt_dir), "main"], cwd=str(repo_dir), check=True, capture_output=True)
+    mod_file = wt_dir / "init.txt"
+    mod_file.write_text("mutated content", encoding="utf-8")
+
+    mgr = GitPromotionManager(repo_dir, release_branch="main")
+    mutation = MutationProposal(
+        proposal_id="mut_attest_test",
+        cluster_id="clust_001",
+        target_repo="mock_repo",
+        rationale="remediate defect",
+        target_files=["init.txt"],
+        diff="dummy diff",
+        branch_name="feature-mut",
+        worktree_path=str(wt_dir),
+    )
+    verdict = ParetoVerdict(
+        candidate_id="mut_attest_test",
+        is_pareto_dominant=True,
+        zero_regression=True,
+        defect_eliminated=True,
+        performance_acceptable=True,
+        security_verified=True,
+        reclaimed_prompt_tokens=42,
+    )
+
+    receipt = mgr.promote_mutation(mutation, verdict)
+    assert receipt.release_id.startswith("rel_")
+
+    card_path = repo_dir / ".autopoiesis" / "attestations" / f"{receipt.release_id}.json"
+    assert card_path.is_file()
+    card_data = json.loads(card_path.read_text(encoding="utf-8"))
+    assert card_data["type"] == "Attested Computation"
+    assert "card_sha256" in card_data
+    assert card_data["reclaimed_tokens"] == 42
+
+
+
 
 
