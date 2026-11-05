@@ -14,9 +14,11 @@ class ParetoGate:
         self,
         max_allowed_latency_degradation_pct: float = 2.0,
         prompt_token_dividend_per_rule: int = 35,
+        min_mutation_kill_score: float = 0.0,
     ):
         self.max_allowed_latency_degradation_pct = max_allowed_latency_degradation_pct
         self.prompt_token_dividend_per_rule = prompt_token_dividend_per_rule
+        self.min_mutation_kill_score = min_mutation_kill_score
 
     def evaluate_candidate(
         self,
@@ -70,8 +72,17 @@ class ParetoGate:
         if not security_verified:
             rejections.append("Security failure: OpSec violation or audit chain discontinuity.")
 
+        # 5. Differential Mutation Testing Check (Causal Minimality)
+        mutation_testing_passed = True
+        if candidate_report.mutation_kill_score is not None:
+            if candidate_report.mutation_kill_score < self.min_mutation_kill_score:
+                mutation_testing_passed = False
+                rejections.append(
+                    f"Mutation Kill Score failure: {candidate_report.mutation_kill_score:.2f} < {self.min_mutation_kill_score:.2f} (patch delta contains surviving mutants / dead code)."
+                )
+
         is_dominant = (
-            zero_regression and defect_eliminated and perf_acceptable and security_verified
+            zero_regression and defect_eliminated and perf_acceptable and security_verified and mutation_testing_passed
         )
 
         reclaimed_tokens = self.prompt_token_dividend_per_rule if is_dominant else 0

@@ -65,6 +65,7 @@ class FitnessReport:
     memory_peak_mb: float
     opsec_passed: bool
     audit_chain_valid: bool
+    mutation_kill_score: Optional[float] = None
     details: Dict[str, Any] = dataclasses.field(default_factory=dict)
 
 
