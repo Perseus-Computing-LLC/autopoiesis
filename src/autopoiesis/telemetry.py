@@ -104,6 +104,14 @@ class ClusterEngine:
         s = error_text.strip()
         # Replace hex hashes / UUIDs
         s = re.sub(r"\b[0-9a-fA-F]{8,64}\b", "<HEX>", s)
+        # Replace line references in stack traces (e.g., file.py:142 -> file.py:<LINE>)
+        s = re.sub(r"([a-zA-Z0-9_\-\./]+\.py):\d+", r"\1:<LINE>", s)
+        # Replace duration tokens (e.g., 30s, 150ms, 2.5h)
+        s = re.sub(r"\b\d+(\.\d+)?(ms|s|m|h)\b", "<DUR>", s)
+        # Replace memory tokens (e.g., 50MB, 4.2GB, 1024bytes)
+        s = re.sub(r"\b\d+(\.\d+)?(MB|GB|KB|bytes|B)\b", "<MEM>", s)
+        # Replace IP addresses
+        s = re.sub(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(:\d+)?\b", "<IP>", s)
         # Replace integers
         s = re.sub(r"\b\d+\b", "<N>", s)
         # Replace quoted paths / strings
@@ -120,14 +128,30 @@ class ClusterEngine:
         if total_calls == 0:
             return []
 
+        # Track sequential retries per tool for transient deconvolution
+        retry_attempts: Dict[str, int] = {}
+        retry_successes: Dict[str, int] = {}
+        last_error_for_tool: Dict[str, str] = {}  # tool -> cid
+
         for ev in events:
-            if ev.status != "error" and (ev.exit_code is None or ev.exit_code == 0):
+            is_err = (ev.status == "error") or (ev.exit_code is not None and ev.exit_code != 0)
+            
+            # Check if this event follows a previous error for the same tool (retry deconvolution)
+            if ev.tool in last_error_for_tool:
+                prev_cid = last_error_for_tool.pop(ev.tool)
+                retry_attempts[prev_cid] = retry_attempts.get(prev_cid, 0) + 1
+                if not is_err:
+                    retry_successes[prev_cid] = retry_successes.get(prev_cid, 0) + 1
+
+            if not is_err:
                 continue
+
             template = self.normalize_template(ev.error_message or f"exit_{ev.exit_code}")
             failure_class = f"{ev.tool}.exit_{ev.exit_code}" if ev.exit_code else f"{ev.tool}.error"
             
             raw_id = f"{ev.tool}:{failure_class}:{template}"
             cid = hashlib.sha256(raw_id.encode("utf-8")).hexdigest()[:12]
+            last_error_for_tool[ev.tool] = cid
 
             if cid not in clusters:
                 clusters[cid] = FailureCluster(
@@ -139,6 +163,8 @@ class ClusterEngine:
                     recent_24h_occurrences=0,
                     sample_events=[],
                     baseline_rate=0.0,
+                    is_transient=False,
+                    transient_retry_rate=0.0,
                 )
             c = clusters[cid]
             c.occurrences += 1
@@ -146,7 +172,15 @@ class ClusterEngine:
             if len(c.sample_events) < 5:
                 c.sample_events.append(ev.sequence)
 
-        for c in clusters.values():
+        for cid, c in clusters.items():
             c.baseline_rate = c.occurrences / float(total_calls)
+            attempts = retry_attempts.get(cid, 0)
+            if attempts > 0:
+                succ = retry_successes.get(cid, 0)
+                rate = float(succ) / float(attempts)
+                c.transient_retry_rate = rate
+                if attempts >= 2 and rate >= 0.5:
+                    c.is_transient = True
 
-        return sorted(clusters.values(), key=lambda x: x.occurrences, reverse=True)
+        # Sort deterministic clusters first, then by occurrence count
+        return sorted(clusters.values(), key=lambda x: (x.is_transient, -x.occurrences))

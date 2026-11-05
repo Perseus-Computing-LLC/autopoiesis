@@ -31,6 +31,8 @@ class FailureCluster:
     recent_24h_occurrences: int
     sample_events: List[int] = dataclasses.field(default_factory=list)
     baseline_rate: float = 0.0
+    is_transient: bool = False
+    transient_retry_rate: float = 0.0
 
 
 @dataclasses.dataclass
