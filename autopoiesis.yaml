@@ -1,0 +1,22 @@
+version: 1
+project:
+  name: "perseus-ecosystem"
+  repo_path: "."
+
+telemetry:
+  adapter: "argus"
+  path: "/opt/data/runtime/argus/audit.jsonl"
+  lookback_days: 7
+
+mutation:
+  sandbox_dir: ".autopoiesis/sandboxes"
+
+evaluation:
+  test_command: "pytest -q"
+  max_latency_degradation_pct: 2.0
+  prompt_token_dividend: 35
+  enforce_red_first: true
+
+deployment:
+  branch: "main"
+  auto_merge: false
