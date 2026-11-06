@@ -38,7 +38,26 @@ def main(argv: list[str] | None = None) -> int:
     status_parser.add_argument("--telemetry", help="Override telemetry file path")
     status_parser.add_argument("--json", action="store_true", help="Output machine-readable JSON status")
 
+    # Red team (AP-3): the mechanical gates of the adversarial review loop; agents call these step by step.
+    rt_parser = subparsers.add_parser("redteam", help="AP-3 red-first review loop gates (open, gate-findings, open-fix, gate-fix, continue, close, status)")
+    rt_parser.add_argument("--target", required=True, help="Target name under the config's `redteam.targets`")
+    rt_parser.add_argument("rest", nargs=argparse.REMAINDER)
+
     args = parser.parse_args(argv)
+
+    if args.command == "redteam":
+        import yaml
+        from autopoiesis import redteam
+
+        raw = yaml.safe_load(Path(args.config).read_text()) or {}
+        section = raw.get("redteam") or {}
+        targets = section.get("targets") or {}
+        if args.target not in targets:
+            print(f"unknown redteam target {args.target!r}; known: {sorted(targets)}", file=sys.stderr)
+            return 2
+        cfg_dict = {k: v for k, v in section.items() if k != "targets"}
+        cfg_dict.update(targets[args.target])
+        return redteam.cli(args.rest, cfg_dict)
 
     if args.command == "init":
         config_path = Path(args.config)

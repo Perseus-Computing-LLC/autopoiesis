@@ -20,3 +20,32 @@ evaluation:
 deployment:
   branch: "main"
   auto_merge: false
+
+# AP-3 red-first review loop (autopoiesis redteam --target NAME <open|gate-findings|open-fix|gate-fix|continue|close|status>)
+redteam:
+  jobs_root: "/opt/data/cache/scratch/redteam-jobs"
+  rotation_path: "/opt/data/runtime/autopoiesis/redteam_rotation.json"
+  ledger_path: "/opt/data/runtime/argus/audit.jsonl"
+  gh_token_cmd: "python3 /opt/data/scripts/get_gh_token.py"
+  max_rounds: 2
+  env_strip: ["KIBISIS_PASSPHRASE", "KIBISIS_PASSPHRASE_FILE", "KIBISIS_SRC", "CI"]
+  cuts:
+    - "laundering and fencing: can a stale lease holder, a replayed token, or a reordered call make a write the invariants forbid"
+    - "atomicity and crash consistency: what state is observable after a kill between any two syscalls of a write path"
+    - "input and path validation: hostile paths, encodings, sizes and types at every public entry point"
+    - "canonical form and hashing: two inputs that differ but hash equal, or one input with two canonical forms"
+    - "error paths and partial failure: which exceptions leave resources, locks or files behind"
+    - "CLI and configuration: flags, environment and files that change behaviour without appearing in receipts"
+  targets:
+    argus:
+      repo_path: "/opt/data/work/telarch-suite/argus"
+      test_command: ["/opt/data/work/telarch-suite/.venv/bin/python", "-m", "pytest", "-q", "-p", "no:cacheprovider"]
+      python_path: "src"
+    harpe:
+      repo_path: "/opt/data/work/telarch-suite/harpe"
+      test_command: ["/opt/data/work/telarch-suite/.venv/bin/python", "-m", "pytest", "-q", "-p", "no:cacheprovider"]
+      python_path: "src"
+    kibisis:
+      repo_path: "/opt/data/work/telarch-suite/kibisis"
+      test_command: ["/opt/data/work/telarch-suite/.venv/bin/python", "-m", "pytest", "-q", "-p", "no:cacheprovider"]
+      python_path: "src"
