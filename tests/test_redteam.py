@@ -183,12 +183,17 @@ def test_rounds_are_bounded_and_stop_at_zero_highs(target: Path, tmp_path: Path)
     assert redteam.should_continue(cfg, job) is False        # budget exhausted
 
 
+# rv1110 F12 (rv1110_findings_unrelated_failure.py): a finding file that never imports the code under review is
+# refused ("does_not_import_product"), because no product fix can turn it green. This test is about the stripped
+# environment, not about that rule, so its finding now imports and uses the product (`one`) and still fails
+# only because the variable was stripped. The old body (os.environ alone) is exactly what F12 refuses.
 def test_tests_run_with_the_environment_stripped(target: Path, tmp_path: Path, monkeypatch):
     cfg = cfg_for(target, tmp_path, env_strip=["SECRET_PASSPHRASE"])
     monkeypatch.setenv("SECRET_PASSPHRASE", "x")
     job = redteam.open_job(cfg, job_id="j9")
     write_finding(Path(job.review), "env",
-                  "import os\n\ndef test_env():\n    assert 'SECRET_PASSPHRASE' in os.environ\n")
+                  "import os\nfrom pkg import one\n\ndef test_env():\n"
+                  "    assert one() == 1 and 'SECRET_PASSPHRASE' in os.environ\n")
     g = redteam.gate_findings(cfg, job, round_n=1)
     assert [f["name"] for f in g["accepted"]] == ["env"]     # it fails only because the env was stripped
 

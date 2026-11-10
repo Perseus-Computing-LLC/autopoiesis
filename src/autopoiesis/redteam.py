@@ -32,6 +32,7 @@ not refused; severity is the reviewer's own declaration.
 """
 from __future__ import annotations
 
+import ast
 import configparser
 import contextlib
 import dataclasses
@@ -52,7 +53,10 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
 GIT_IDENTITY = ["-c", "user.name=Hermes", "-c", "user.email=hermes@perseuscomputing.com"]
-SEVERITY_RE = re.compile(r"^[\s\"']*severity:\s*(high|medium|low)\s*$", re.I | re.M)
+# The declared level is the first word after `severity:`; a trailing remark does not change it.
+SEVERITY_RE = re.compile(r"^[\s\"']*severity\s*:\s*(high|medium|low)\b", re.I | re.M)
+JOB_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+ARGUS_SRC_ENV = "AUTOPOIESIS_ARGUS_SRC"
 DEFAULT_ENV_STRIP = ["KIBISIS_PASSPHRASE", "KIBISIS_PASSPHRASE_FILE", "KIBISIS_SRC", "CI"]
 # Files that steer the test run itself. A fix branch may not change them (gate_fix: test_infrastructure_modified).
 TEST_CONTROL_FILES = frozenset({"conftest.py", "pytest.ini", ".pytest.ini", "sitecustomize.py", "usercustomize.py"})
@@ -78,6 +82,8 @@ class RedTeamConfig:
     actor: str = "autopoiesis.redteam"
     allow_test_config_changes: bool = False       # let a fix branch edit conftest.py / pytest configuration
     api_timeout: float = 30.0                     # seconds, per GitHub API call in close_job
+    argus_src: Optional[str] = None               # directory holding the argus_ledger package when it is not
+                                                  # installed (also: environment variable AUTOPOIESIS_ARGUS_SRC)
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "RedTeamConfig":
@@ -161,19 +167,42 @@ def _save(job: Job, state: Dict[str, Any]) -> None:
     os.replace(tmp, _state_path(job))
 
 
+def _ledger_class(cfg: RedTeamConfig) -> Any:
+    """argus_ledger's AppendOnlyLedger: the installed package, else the checkout named by configuration.
+
+    The checkout location comes from `argus_src` in the redteam config or from AUTOPOIESIS_ARGUS_SRC; no
+    location is built in.
+    """
+    try:
+        from argus_ledger.ledger import AppendOnlyLedger  # type: ignore
+        return AppendOnlyLedger
+    except ImportError as exc:
+        first = exc
+    src = cfg.argus_src or os.environ.get(ARGUS_SRC_ENV)
+    if not src:
+        raise ImportError(
+            f"a ledger is configured ({cfg.ledger_path}) but the argus_ledger package is not importable "
+            f"({first}); install it, or set `argus_src` in the redteam config or {ARGUS_SRC_ENV} to the "
+            f"directory that contains it") from first
+    src_path = Path(src)
+    if not src_path.is_dir():
+        raise ImportError(f"argus_src is not a directory: {src_path}") from first
+    if str(src_path) not in sys.path:
+        sys.path.insert(0, str(src_path))
+    try:
+        from argus_ledger.ledger import AppendOnlyLedger  # type: ignore
+    except ImportError as exc:
+        raise ImportError(f"argus_ledger is not importable from argus_src={src_path}: {exc}") from exc
+    return AppendOnlyLedger
+
+
 def _receipt(cfg: RedTeamConfig, event_type: str, payload: Dict[str, Any]) -> Optional[int]:
     """One Argus receipt per gate; ints and strings only. Returns the sequence, or None without a ledger."""
     if not cfg.ledger_path:
         return None
-    try:
-        from argus_ledger.ledger import AppendOnlyLedger  # type: ignore
-    except ImportError:  # the argus checkout on this box, when the package is not installed
-        argus_src = Path("/opt/data/work/telarch-suite/argus/src")
-        if argus_src.is_dir() and str(argus_src) not in sys.path:
-            sys.path.insert(0, str(argus_src))
-        from argus_ledger.ledger import AppendOnlyLedger  # type: ignore
+    ledger = _ledger_class(cfg)
     clean = {k: (v if isinstance(v, int) and not isinstance(v, bool) else str(v)) for k, v in payload.items()}
-    rc = AppendOnlyLedger(cfg.ledger_path).append(event_type=event_type, actor=cfg.actor, payload=clean)
+    rc = ledger(cfg.ledger_path).append(event_type=event_type, actor=cfg.actor, payload=clean)
     return int(rc.sequence)
 
 
@@ -193,8 +222,11 @@ def _run_tests(cfg: RedTeamConfig, worktree: str | Path, targets: List[str], log
     """
     cmd = [*cfg.test_command, *(targets or [cfg.test_dir])]
     if junit is not None:
+        junit.parent.mkdir(parents=True, exist_ok=True)
         junit.unlink(missing_ok=True)
-        cmd.append(f"--junitxml={junit}")
+        # test ids are relative to pytest's rootdir: pin it to the tree, or a config file in some parent
+        # directory would put the checkout's own name into every id
+        cmd += [f"--rootdir={worktree}", f"--junitxml={junit}"]
     log.parent.mkdir(parents=True, exist_ok=True)
     with open(log, "w") as fh:
         p = subprocess.run(cmd, cwd=str(worktree), env=_test_env(cfg, str(worktree)), stdout=fh,
@@ -283,13 +315,105 @@ def _require_open(state: Dict[str, Any]) -> None:
         raise RuntimeError(f"job {state.get('job_id')} is closed")
 
 
-def _severity(path: Path) -> str:
-    m = SEVERITY_RE.search(path.read_text(errors="replace")[:2000])
-    return m.group(1).lower() if m else "medium"
+def _severity(text: str) -> Optional[str]:
+    """The level declared in the file's header, or None when no `severity: high|medium|low` line is there."""
+    m = SEVERITY_RE.search(text[:2000])
+    return m.group(1).lower() if m else None
 
 
 def _finding_name(path: Path, round_n: int) -> str:
     return path.name[len(f"review{round_n}_"):-3]
+
+
+def _product_modules(tree: Path, cfg: RedTeamConfig) -> set:
+    """Top-level importable names of the code under review, as laid out in a clean checkout."""
+    root = tree / cfg.python_path if cfg.python_path else tree
+    skip = {Path(cfg.test_dir).parts[0], Path(cfg.notes_dir).parts[0]}
+    names = set()
+    if root.is_dir():
+        for entry in root.iterdir():
+            if entry.name.startswith(".") or (not cfg.python_path and entry.name in skip):
+                continue
+            if entry.is_file() and entry.suffix == ".py" and entry.stem not in ("setup", "conftest"):
+                names.add(entry.stem)
+            elif entry.is_dir() and entry.name.isidentifier() and next(entry.rglob("*.py"), None) is not None:
+                names.add(entry.name)
+    return names
+
+
+def _imported_modules(tree: ast.AST) -> set:
+    """Top-level names the file imports, at module level or inside functions, statically or by name string."""
+    found = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            found.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            found.add(node.module.split(".")[0])
+        elif isinstance(node, ast.Call) and node.args and isinstance(node.args[0], ast.Constant) \
+                and isinstance(node.args[0].value, str):
+            fn = node.func
+            if (fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", "")) in ("import_module", "__import__",
+                                                                                         "importorskip"):
+                found.add(node.args[0].value.split(".")[0])
+    return found
+
+
+_CONSTANT_NAMES = ("AssertionError", "Exception", "True", "False", "None")
+
+
+def _constant_test(fn: ast.AST) -> bool:
+    """True when a test function's outcome cannot depend on anything: no call, no name, no attribute read."""
+    body = [st for st in fn.body  # type: ignore[attr-defined]
+            if not (isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant))]
+    for st in body:
+        for node in ast.walk(st):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _CONSTANT_NAMES:
+                continue                                 # raise AssertionError("text")
+            if isinstance(node, (ast.Call, ast.Attribute, ast.Subscript, ast.Await, ast.Import, ast.ImportFrom)):
+                return False
+            if isinstance(node, ast.Name) and node.id not in _CONSTANT_NAMES:
+                return False
+    return True
+
+
+def _static_refusal(source: str, product: set) -> Optional[str]:
+    """Why a finding file cannot be evidence about the product, judged without running it (None = no objection).
+
+    This is a floor, not a proof: a file that imports the product and then asserts something unrelated passes it.
+    """
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return "does_not_run"
+    tests = [n for n in ast.walk(tree)
+             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith("test")]
+    if tests and all(_constant_test(fn) for fn in tests):
+        return "trivial_test"
+    if product and not (_imported_modules(tree) & product):
+        return "does_not_import_product"
+    return None
+
+
+_MISSING_MODULE_RE = re.compile(r"ModuleNotFoundError: No module named '([^']+)'")
+
+
+def _judge_on_head(rc: int, module: str, outcomes: Optional[Dict[str, Dict[str, str]]], product: set) -> tuple:
+    """(reason for refusal or None, ids of the tests that failed) for one finding file run on the clean head."""
+    if rc == 0:
+        return "passes_on_head", []
+    if rc != 1:
+        return "does_not_run", []
+    if outcomes is None:
+        return "no_test_report", []
+    mine = {t: o for t, o in outcomes.items() if _in_module(t, module)}
+    failed = sorted(t for t, o in mine.items() if o["outcome"] == "failed")
+    if any(o["outcome"] == "error" for o in mine.values()) or not failed:
+        return "does_not_run", []                       # a fixture or collection error is not a failing assertion
+    for t in failed:
+        m = _MISSING_MODULE_RE.search(mine[t]["message"])
+        if m and m.group(1).split(".")[0] not in product:
+            return "missing_dependency", []             # fails for want of a package, not because of the product
+    return None, failed
 
 
 def _sha(path: Path) -> str:
@@ -297,46 +421,102 @@ def _sha(path: Path) -> str:
 
 
 # --------------------------------------------------------------------------------------------- rotation
-def next_cut(rotation_path: str | Path, repo: str, cuts: List[str]) -> str:
-    """The first cut this repo has not had this lap; wraps when every cut has been used. History is kept."""
+def _rotation(rotation_path: str | Path, repo: str, cuts: List[str]) -> tuple:
+    """(history, cut) without writing anything. Raises ValueError on no cuts or an unreadable history."""
+    if not cuts:
+        raise ValueError("no cuts configured")
     path = Path(rotation_path)
-    hist: Dict[str, List[str]] = json.loads(path.read_text()) if path.is_file() else {}
+    try:
+        hist = json.loads(path.read_text()) if path.is_file() else {}
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"rotation file is unreadable: {path}: {exc}") from exc
+    if not isinstance(hist, dict) or not all(isinstance(v, list) for v in hist.values()):
+        raise ValueError(f"rotation file is not a mapping of repo -> list of cuts: {path}")
     used = hist.get(repo, [])
     lap = used[-(len(used) % len(cuts)):] if len(used) % len(cuts) else []
-    cut = next(c for c in cuts if c not in lap)
+    cut = next((c for c in cuts if c not in lap), cuts[0])
+    return hist, cut
+
+
+def _record_cut(rotation_path: str | Path, hist: Dict[str, List[str]], repo: str, cut: str) -> None:
+    path = Path(rotation_path)
     hist.setdefault(repo, []).append(cut)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(hist, indent=1, sort_keys=True))
+    tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(hist, indent=1, sort_keys=True))
+        os.replace(tmp, path)                               # a reader sees the old file or the new one, never half
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def next_cut(rotation_path: str | Path, repo: str, cuts: List[str]) -> str:
+    """The first cut this repo has not had this lap; wraps when every cut has been used. History is kept."""
+    hist, cut = _rotation(rotation_path, repo, cuts)
+    _record_cut(rotation_path, hist, repo, cut)
     return cut
 
 
 # --------------------------------------------------------------------------------------------- job lifecycle
 def open_job(cfg: RedTeamConfig, job_id: str, cut: Optional[str] = None) -> Job:
+    """Create the job (directory, branch, two worktrees, state, brief) or nothing at all."""
+    if not JOB_ID_RE.fullmatch(job_id or ""):
+        raise RuntimeError(f"job id must match {JOB_ID_RE.pattern}: {job_id!r}")
+    if not cfg.cuts:
+        raise RuntimeError("no cuts configured")
+    if not cfg.test_command:
+        raise RuntimeError("no test_command configured")
+    if cfg.max_rounds < 1:
+        raise RuntimeError("max_rounds must be at least 1")
     repo = Path(cfg.repo_path).resolve()
     if _out(repo, "status", "--porcelain"):
         raise RuntimeError(f"target worktree is dirty: {repo}")
-    base_head = _out(repo, "rev-parse", cfg.base_branch)
+    base_head = _out(repo, "rev-parse", "--verify", f"{cfg.base_branch}^{{commit}}")
+    branch = f"redteam/{job_id}"
     job_dir = Path(cfg.jobs_root) / job_id
     if job_dir.exists():
         raise RuntimeError(f"job exists: {job_dir}")
-    job_dir.mkdir(parents=True)
+    if _git(repo, "rev-parse", "-q", "--verify", f"refs/heads/{branch}", check=False).returncode == 0:
+        raise RuntimeError(f"branch {branch} already exists in {repo}")
+    hist: Optional[Dict[str, List[str]]] = None
+    if cut is None:
+        try:
+            hist, cut = _rotation(cfg.rotation_path, repo.name, cfg.cuts)     # read-only: fails before anything exists
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
     integ, review = job_dir / "integration", job_dir / "review"
-    _git(repo, "worktree", "add", "-q", "-b", f"redteam/{job_id}", str(integ), base_head)
-    _git(repo, "worktree", "add", "-q", "--detach", str(review), base_head)
-    cut = cut or next_cut(cfg.rotation_path, repo.name, cfg.cuts)
-    job = Job(job_id, str(job_dir), str(integ), str(review), None, base_head, cut, str(repo))
-    _save(job, {"job_id": job_id, "repo": str(repo), "base_head": base_head, "cut": cut, "status": "open",
-                "opened_at": int(time.time()), "rounds": [], "branch": f"redteam/{job_id}"})
-    (job_dir / "reviewer_brief.md").write_text(reviewer_brief(cfg, job, 1))
-    seq = _receipt(cfg, "redteam.job_opened", {"job_id": job_id, "repo": repo.name, "base_head": base_head, "cut": cut,
-                                               "max_rounds": cfg.max_rounds})
-    if seq is not None:
-        st = _load(job); st["receipts"] = [seq]; _save(job, st)
+    try:
+        job_dir.mkdir(parents=True)
+        _git(repo, "worktree", "add", "-q", "-b", branch, str(integ), base_head)
+        _git(repo, "worktree", "add", "-q", "--detach", str(review), base_head)
+        job = Job(job_id, str(job_dir), str(integ), str(review), None, base_head, cut, str(repo))
+        state = {"job_id": job_id, "repo": str(repo), "base_head": base_head, "cut": cut, "status": "open",
+                 "opened_at": int(time.time()), "rounds": [], "branch": branch}
+        _save(job, state)
+        (job_dir / "reviewer_brief.md").write_text(reviewer_brief(cfg, job, 1))
+        if hist is not None:
+            _record_cut(cfg.rotation_path, hist, repo.name, cut)
+        seq = _receipt(cfg, "redteam.job_opened", {"job_id": job_id, "repo": repo.name, "base_head": base_head,
+                                                   "cut": cut, "max_rounds": cfg.max_rounds})
+        if seq is not None:
+            state["receipts"] = [seq]; _save(job, state)
+    except BaseException:
+        # nothing of a failed open stays behind: the id can be reused once the cause is repaired
+        for wt in (review, integ):
+            _git(repo, "worktree", "remove", "--force", str(wt), check=False)
+        shutil.rmtree(job_dir, ignore_errors=True)
+        _git(repo, "worktree", "prune", check=False)
+        _git(repo, "branch", "-q", "-D", branch, check=False)        # it did not exist before this call (checked above)
+        raise
     return job
 
 
 def load_job(cfg: RedTeamConfig, job_id: str) -> Job:
+    if not JOB_ID_RE.fullmatch(job_id or ""):
+        raise RuntimeError(f"job id must match {JOB_ID_RE.pattern}: {job_id!r}")
     job_dir = Path(cfg.jobs_root) / job_id
+    if not (job_dir / "job.json").is_file():
+        raise RuntimeError(f"no such job: {job_id}")
     st = json.loads((job_dir / "job.json").read_text())
     fix = job_dir / "fix"
     return Job(job_id, str(job_dir), str(job_dir / "integration"), str(job_dir / "review"),
@@ -351,10 +531,14 @@ Worktree: `{job.review}` (detached at `{head[:12]}`). Repository: `{Path(job.rep
 
 Review this code adversarially through the cut **{job.cut}**. Read SECURITY.md and the threat model first.
 
-Prove every finding with a test that FAILS on this head: `{cfg.test_dir}/review{round_n}_<name>.py`, module
-docstring first lines `severity: high|medium|low` and `finding: <one line>`. The harness runs each file on the
-unpatched head and keeps only the ones that fail (pytest exit 1); a test that passes or does not run is discarded,
-so run yours before you finish. Do not fix anything, do not edit existing source or tests. Write the narrative
+Prove every finding with a test that FAILS on this head: `{cfg.test_dir}/review{round_n}_<name>.py` (name:
+letters, digits, underscore), module docstring first lines `severity: high|medium|low` and `finding: <one line>`.
+The harness copies each such file, alone, into a fresh checkout of this head and runs it there: nothing else in
+this worktree takes part, so a finding may not depend on a source edit, a conftest.py or a helper module you add
+here. It keeps a file only when the run exits 1 with a failing assertion; a file that passes, does not run,
+errors in a fixture, fails for want of a package that is not installed, never imports the code under review
+or contains only constant assertions is discarded, so run yours before you finish. A file without a readable
+severity line is treated as high. Do not fix anything, do not edit existing source or tests. Write the narrative
 with file:line references to `{cfg.notes_dir}/R{round_n}.md`. Severity high = integrity, confidentiality,
 atomicity or lease/fencing guarantees broken, or data loss; medium = wrong result under realistic misuse;
 low = everything else.
@@ -391,49 +575,176 @@ outside the worktree.
 """
 
 
+def _expected_head(state: Dict[str, Any]) -> str:
+    """Where the integration branch must be when the next round is gated."""
+    return state["rounds"][-1]["merged_head"] if state["rounds"] else state["base_head"]
+
+
+def _settle_pending(job: Job, state: Dict[str, Any], cfg: RedTeamConfig) -> Optional[Dict[str, Any]]:
+    """Finish or undo an evidence commit that was interrupted between `git commit` and the state write.
+
+    Returns the round record when the commit had landed intact (the round is then recorded), else None after
+    the integration tree is back at the head the round started from.
+    """
+    pend = state.get("pending")
+    if not pend:
+        return None
+    integ, parent, rec = Path(job.integration), pend["parent"], pend["record"]
+    head = _out(integ, "rev-parse", "HEAD")
+    landed = head != parent and _out(integ, "rev-parse", "HEAD^") == parent and not _out(integ, "status", "--porcelain")
+    if landed:
+        for f in rec["accepted"]:
+            data = _blob(job.repo, head, f"{cfg.test_dir}/{f['file']}")
+            landed = landed and data is not None and hashlib.sha256(data).hexdigest() == f["sha256"]
+    if landed:
+        rec["evidence_head"] = head
+        state["rounds"].append(rec)
+        state["status"] = "findings_gated" if rec["accepted"] else "no_findings"
+    elif head == parent or _out(integ, "rev-parse", "HEAD^") == parent:
+        _git(integ, "reset", "-q", "--hard", parent)
+        _git(integ, "clean", "-qfd")
+    else:
+        raise RuntimeError(f"integration branch moved to {head[:12]} during an unfinished evidence commit "
+                           f"(expected {parent[:12]} or its child); repair it by hand")
+    del state["pending"]
+    _save(job, state)
+    return rec if landed else None
+
+
 def gate_findings(cfg: RedTeamConfig, job: Job, round_n: int) -> Dict[str, Any]:
-    """Admit only finding tests that fail on the unpatched head; commit the evidence on the integration branch."""
-    review = Path(job.review)
-    logs = Path(job.path) / "logs"; logs.mkdir(exist_ok=True)
-    accepted, rejected = [], []
-    for test in sorted((review / cfg.test_dir).glob(f"review{round_n}_*.py")):
-        name = _finding_name(test, round_n)
-        rc = _run_tests(cfg, job.review, [str(test.relative_to(review))], logs / f"r{round_n}_head_{name}.log")
-        if rc == 1:
-            accepted.append({"name": name, "severity": _severity(test), "sha256": _sha(test), "file": test.name})
-        else:
-            rejected.append({"name": name, "reason": "passes_on_head" if rc == 0 else "does_not_run", "rc": rc})
-    integ = Path(job.integration)
-    for f in accepted:
-        shutil.copy2(review / cfg.test_dir / f["file"], integ / cfg.test_dir / f["file"])
-    notes = review / cfg.notes_dir / f"R{round_n}.md"
-    if notes.is_file():
-        (integ / cfg.notes_dir).mkdir(exist_ok=True)
-        shutil.copy2(notes, integ / cfg.notes_dir / notes.name)
-    if accepted or notes.is_file():
-        _git(integ, "add", "-A")
-        _git(integ, "commit", "-qm", f"review {round_n} ({job.cut}): {len(accepted)} finding(s) proven on "
-                                      f"{job.base_head[:12]}; {len(rejected)} refused")
-    highs = sum(1 for f in accepted if f["severity"] == "high")
+    """Admit only finding tests that fail on the unpatched head; commit the evidence on the integration branch.
+
+    Each `review<N>_*.py` is run alone in a fresh checkout of the integration head: nothing else the reviewer
+    left in the review worktree (edited source, conftest.py, helper modules) takes part. Rounds are gated once
+    each, in order 1..max_rounds; the round is recorded in job.json together with the evidence commit, and a
+    commit that fails leaves the integration tree as it was.
+    """
     st = _load(job)
-    st["rounds"].append({"round": round_n, "accepted": accepted, "rejected": rejected, "highs": highs,
-                         "evidence_head": _out(integ, "rev-parse", "HEAD"), "gated_at": int(time.time())})
+    _require_open(st)
+    recovered = _settle_pending(job, st, cfg)
+    if recovered is not None and recovered["round"] == round_n:
+        return {"accepted": recovered["accepted"], "rejected": recovered["rejected"], "highs": recovered["highs"],
+                "receipt": None, "recovered": True}
+    done = len(st["rounds"])
+    if not isinstance(round_n, int) or isinstance(round_n, bool) or round_n != done + 1:
+        raise RuntimeError(f"round {round_n} cannot be gated: {done} round(s) are recorded, the next is {done + 1}")
+    if round_n > cfg.max_rounds:
+        raise RuntimeError(f"round {round_n} exceeds max_rounds={cfg.max_rounds}")
+    if done and st["rounds"][-1].get("fix") != "merged":
+        raise RuntimeError(f"round {done} has no merged fix; a new review round has nothing new to review")
+    integ, review = Path(job.integration), Path(job.review)
+    head = _expected_head(st)
+    if _out(integ, "rev-parse", "HEAD") != head or _out(integ, "status", "--porcelain"):
+        raise RuntimeError(f"integration worktree is not clean at {head[:12]}")
+    logs = Path(job.path) / "logs"; logs.mkdir(exist_ok=True)
+
+    # what the reviewer offers: bytes are read once, and those bytes are what is tested, hashed and committed
+    offered: List[Dict[str, Any]] = []
+    rejected: List[Dict[str, Any]] = []
+    prefix = f"review{round_n}_"
+    for test in sorted((review / cfg.test_dir).glob(f"{prefix}*.py")):
+        name = _finding_name(test, round_n)
+        rel = f"{cfg.test_dir}/{test.name}"
+        if test.is_symlink() or not test.is_file():
+            rejected.append({"name": name, "reason": "not_a_regular_file", "rc": -1})
+        elif not re.fullmatch(r"[A-Za-z0-9_]+", name):
+            rejected.append({"name": name, "reason": "bad_file_name", "rc": -1})
+        elif _blob(job.repo, head, rel) is not None:
+            rejected.append({"name": name, "reason": "already_in_head", "rc": -1})
+        else:
+            offered.append({"name": name, "file": test.name, "rel": rel, "data": test.read_bytes()})
+    notes_src = review / cfg.notes_dir / f"R{round_n}.md"
+    notes = notes_src.read_bytes() if notes_src.is_file() and not notes_src.is_symlink() else None
+
+    accepted: List[Dict[str, Any]] = []
+    if offered:
+        with _clean_checkout(job, f"r{round_n}_head", head) as tree:
+            product = _product_modules(tree, cfg)
+            for f in offered:
+                source = f["data"].decode("utf-8", "replace")
+                _pristine(tree)
+                (tree / cfg.test_dir).mkdir(parents=True, exist_ok=True)
+                (tree / f["rel"]).write_bytes(f["data"])
+                xml = logs / f"r{round_n}_head_{f['name']}.xml"
+                rc = _run_tests(cfg, tree, [f["rel"]], logs / f"r{round_n}_head_{f['name']}.log", junit=xml)
+                reason, failed = _judge_on_head(rc, _module_id(cfg, f["file"]), _junit_outcomes(xml), product)
+                if reason is None:                           # red on the head: is it red because of the product?
+                    reason = _static_refusal(source, product)
+                if reason is not None:
+                    rejected.append({"name": f["name"], "reason": reason, "rc": rc})
+                    continue
+                declared = _severity(source)
+                # No readable header is not a reason to drop a proven finding, nor to call it medium: it counts
+                # as high (the loop goes on) and the record says the level was not declared.
+                accepted.append({"name": f["name"], "severity": declared or "high",
+                                 "severity_declared": declared is not None,
+                                 "sha256": hashlib.sha256(f["data"]).hexdigest(), "file": f["file"], "tests": failed})
+    rejected.sort(key=lambda r: r["name"])
+    highs = sum(1 for f in accepted if f["severity"] == "high")
+    record: Dict[str, Any] = {"round": round_n, "accepted": accepted, "rejected": rejected, "highs": highs,
+                              "evidence_head": head, "gated_at": int(time.time())}
+    if notes is not None:
+        record["notes_sha256"] = hashlib.sha256(notes).hexdigest()
+
+    if accepted or notes is not None:
+        by_file = {f["file"]: f["data"] for f in offered}
+        paths = []
+        # the intent is on disk before the tree is touched; a crash from here on is settled by _settle_pending
+        st["pending"] = {"parent": head, "record": record}; _save(job, st)
+        try:
+            (integ / cfg.test_dir).mkdir(parents=True, exist_ok=True)
+            for f in accepted:
+                (integ / cfg.test_dir / f["file"]).write_bytes(by_file[f["file"]])
+                paths.append(f"{cfg.test_dir}/{f['file']}")
+            if notes is not None:
+                (integ / cfg.notes_dir).mkdir(parents=True, exist_ok=True)
+                (integ / cfg.notes_dir / notes_src.name).write_bytes(notes)
+                paths.append(f"{cfg.notes_dir}/{notes_src.name}")
+            _git(integ, "add", "-f", "--", *paths)          # exactly the evidence, even where .gitignore matches
+            done_commit = _git(integ, "commit", "-qm", f"review {round_n} ({job.cut}): {len(accepted)} finding(s) "
+                               f"proven on {head[:12]}; {len(rejected)} refused", check=False)
+            if done_commit.returncode != 0:
+                raise RuntimeError("evidence commit failed: "
+                                   + (done_commit.stderr or done_commit.stdout).strip()[-500:])
+            record["evidence_head"] = _out(integ, "rev-parse", "HEAD")
+        except BaseException:
+            _git(integ, "reset", "-q", "--hard", head, check=False)
+            _git(integ, "clean", "-qfd", check=False)
+            st.pop("pending", None); _save(job, st)
+            raise
+    st["rounds"].append(record)
+    st.pop("pending", None)
     st["status"] = "findings_gated" if accepted else "no_findings"
-    _save(job, st)
+    _save(job, st)                                           # one atomic write: round recorded, intent cleared
     seq = _receipt(cfg, "redteam.findings_gated", {"job_id": job.job_id, "round": round_n, "cut": job.cut,
                                                    "accepted": len(accepted), "rejected": len(rejected), "highs": highs,
-                                                   "evidence_head": st["rounds"][-1]["evidence_head"]})
+                                                   "evidence_head": record["evidence_head"]})
     if seq is not None:
-        st = _load(job); st.setdefault("receipts", []).append(seq); _save(job, st)
+        st.setdefault("receipts", []).append(seq); _save(job, st)
     return {"accepted": accepted, "rejected": rejected, "highs": highs, "receipt": seq}
 
 
 def open_fix(cfg: RedTeamConfig, job: Job, round_n: int) -> str:
     """The fixer's worktree on its own branch from the integration head (which carries the evidence)."""
+    st = _load(job)
+    _require_open(st)
+    if st.get("pending"):
+        raise RuntimeError("an evidence commit is unfinished; re-run gate-findings first")
+    rnd = _round(st, round_n)
+    if round_n != len(st["rounds"]):
+        raise RuntimeError(f"round {round_n} is not the current round ({len(st['rounds'])})")
+    if rnd.get("fix") == "merged":
+        raise RuntimeError(f"round {round_n} is already merged")
+    if not rnd["accepted"]:
+        raise RuntimeError(f"round {round_n} has no accepted findings; there is nothing to fix")
+    head = rnd["evidence_head"]
+    if _out(job.integration, "rev-parse", "HEAD") != head:
+        raise RuntimeError(f"integration worktree is not at the evidence head {head[:12]}")
     fix = Path(job.path) / "fix"
     if fix.exists():
-        _git(job.repo, "worktree", "remove", "--force", str(fix))
-    head = _out(job.integration, "rev-parse", "HEAD")
+        _git(job.repo, "worktree", "remove", "--force", str(fix), check=False)
+        shutil.rmtree(fix, ignore_errors=True)
+        _git(job.repo, "worktree", "prune", check=False)
     _git(job.repo, "branch", "-q", "-D", f"redteam/{job.job_id}-fix{round_n}", check=False)
     _git(job.repo, "worktree", "add", "-q", "-b", f"redteam/{job.job_id}-fix{round_n}", str(fix), head)
     job.fix = str(fix)
