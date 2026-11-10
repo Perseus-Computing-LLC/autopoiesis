@@ -44,6 +44,8 @@ import subprocess
 import sys
 import time
 import tomllib
+import urllib.error
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -75,6 +77,7 @@ class RedTeamConfig:
     gh_token_cmd: Optional[str] = None            # command printing a GitHub token, for close_job
     actor: str = "autopoiesis.redteam"
     allow_test_config_changes: bool = False       # let a fix branch edit conftest.py / pytest configuration
+    api_timeout: float = 30.0                     # seconds, per GitHub API call in close_job
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "RedTeamConfig":
@@ -591,61 +594,189 @@ def should_continue(cfg: RedTeamConfig, job: Job) -> bool:
     return rounds[-1]["highs"] > 0
 
 
+def _scrub(text: Any, secrets: List[str]) -> str:
+    """`text` with every secret replaced; used on anything that may reach an exception, a log or job.json."""
+    out = str(text)
+    for secret in secrets:
+        if secret:
+            out = out.replace(secret, "***")
+    return out
+
+
+def _git_env(config: List[tuple], **extra: str) -> Dict[str, str]:
+    """The process environment plus per-command git config (GIT_CONFIG_COUNT/KEY/VALUE): nothing goes in argv."""
+    env = dict(os.environ)
+    try:
+        n = int(env.get("GIT_CONFIG_COUNT") or 0)
+    except ValueError:
+        n = 0
+    for i, (key, value) in enumerate(config):
+        env[f"GIT_CONFIG_KEY_{n + i}"] = key
+        env[f"GIT_CONFIG_VALUE_{n + i}"] = value
+    env["GIT_CONFIG_COUNT"] = str(n + len(config))
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env.update(extra)
+    return env
+
+
+# A credential helper that answers from the environment. Its text (in git's config, hence in `sh -c` argv)
+# names the variable, never its value.
+_CREDENTIAL_HELPER = ("!f() { test \"$1\" = get && "
+                      "printf 'username=x-access-token\\npassword=%s\\n' \"$AUTOPOIESIS_GH_TOKEN\"; }; f")
+
+
+def _push(job: Job, org: str, name: str, token: str, head: str, branch: str) -> None:
+    """Push `head` to refs/heads/<branch> of the GitHub repo and check the remote ref.
+
+    The token never appears in an argv, an exception or a log:
+    * the destination is resolved first, with the credentialed URL form handed to git through the environment
+      (`ls-remote --get-url` contacts nothing), so `url.<base>.insteadOf` rules written against that form keep
+      working;
+    * the push itself goes to a credential-free URL and git asks `_CREDENTIAL_HELPER`, which reads the
+      environment (so the https transport helper's argv is clean too);
+    * every message built from git's output is scrubbed.
+    """
+    secrets = [token, urllib.parse.quote(token, safe="")]
+    credentialed = "https://x-access-token:" + secrets[1] + "@" + f"github.com/{org}/{name}.git"
+    alias = f"autopoiesis-push-{os.getpid()}"
+    probe = _git(job.repo, "ls-remote", "--get-url", alias, check=False,
+                 env=_git_env([(f"remote.{alias}.url", credentialed)]))
+    target = probe.stdout.strip()
+    if probe.returncode != 0 or not target or target == alias:
+        raise RuntimeError("cannot resolve the push URL: " + _scrub(probe.stderr.strip()[-500:], secrets))
+    if any(secret in target for secret in secrets):
+        parts = urllib.parse.urlsplit(target)
+        host = (parts.hostname or "") + (f":{parts.port}" if parts.port else "")
+        target = urllib.parse.urlunsplit((parts.scheme, host, parts.path, parts.query, parts.fragment))
+        if not host or any(secret in target for secret in secrets):
+            raise RuntimeError("cannot build a credential-free push URL")
+    env = _git_env([("credential.helper", ""), ("credential.helper", _CREDENTIAL_HELPER)],
+                   AUTOPOIESIS_GH_TOKEN=token)
+    push = _git(job.repo, "push", "-q", target, f"{head}:refs/heads/{branch}", check=False, env=env)
+    if push.returncode != 0:
+        raise RuntimeError(f"git push failed (exit {push.returncode}): " + _scrub(push.stderr.strip()[-800:], secrets))
+    seen = _git(job.repo, "ls-remote", target, f"refs/heads/{branch}", check=False, env=env)
+    if seen.returncode != 0 or seen.stdout.split()[:1] != [head]:
+        raise RuntimeError(f"after the push, refs/heads/{branch} on the remote does not point at {head[:12]}")
+
+
+def _github(url: str, token: str, timeout: float, payload: Optional[Dict[str, Any]] = None) -> Any:
+    """One GitHub API call with a timeout. Raises urllib.error.HTTPError as is (it carries no request headers)."""
+    headers = {"Authorization": f"Bearer {token}", "User-Agent": "autopoiesis"}
+    data = None
+    if payload is not None:
+        data = json.dumps(payload).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST" if payload is not None else "GET")
+    return json.load(urllib.request.urlopen(req, timeout=timeout))
+
+
+def _drop_worktrees(job: Job) -> None:
+    for wt in ("review", "fix", "integration"):   # the branch ref stays in the target repo; the worktrees are scratch
+        p = Path(job.path) / wt
+        if p.is_dir():
+            _git(job.repo, "worktree", "remove", "--force", str(p), check=False)
+    shutil.rmtree(Path(job.path) / "gate", ignore_errors=True)
+    _git(job.repo, "worktree", "prune", check=False)
+
+
 def close_job(cfg: RedTeamConfig, job: Job, open_pr: bool = True) -> Dict[str, Any]:
-    """Push the integration branch by SHA and open a PR for a human to merge; or close with nothing to show."""
+    """Push the integration branch by SHA and open a PR for a human to merge; or close with nothing to show.
+
+    Closing a closed job changes nothing and returns what the first close recorded.
+    """
     st = _load(job)
     merged = [r for r in st["rounds"] if r.get("fix") == "merged"]
+    if str(st.get("status", "")).startswith("closed"):
+        _drop_worktrees(job)
+        return {"job_id": job.job_id, "head": st["final_head"], "rounds": len(st["rounds"]),
+                "merged_rounds": len(merged), "pr": st.get("pr"), "receipt": st.get("close_receipt"),
+                "already_closed": True}
+    if st.get("pending"):
+        raise RuntimeError("an evidence commit is unfinished; re-run gate-findings first")
     head = _out(job.integration, "rev-parse", "HEAD")
     result: Dict[str, Any] = {"job_id": job.job_id, "head": head, "rounds": len(st["rounds"]),
                               "merged_rounds": len(merged), "pr": None}
     if merged and open_pr and cfg.gh_token_cmd:
-        token = subprocess.check_output(cfg.gh_token_cmd, shell=True, text=True).strip()
+        got = subprocess.run(cfg.gh_token_cmd, shell=True, capture_output=True, text=True)
+        token = got.stdout.strip()
+        if got.returncode != 0 or not token:        # the command's output is not echoed: it may hold a credential
+            raise RuntimeError(f"gh_token_cmd gave no token (exit {got.returncode})")
+        secrets = [token, urllib.parse.quote(token, safe="")]
         url = _out(job.repo, "remote", "get-url", "origin")
         m = re.search(r"github\.com[:/]([^/]+)/([^/.]+)", url)
         if not m:
-            raise RuntimeError(f"not a GitHub remote: {url}")
+            raise RuntimeError("not a GitHub remote: " + _scrub(url, secrets))
         org, name = m.group(1), m.group(2)
-        push_url = f"https://x-access-token:{token}@github.com/{org}/{name}.git"
-        _git(job.repo, "push", "-q", push_url, f"{head}:refs/heads/{st['branch']}")
-        remote = json.load(urllib.request.urlopen(urllib.request.Request(
-            f"https://api.github.com/repos/{org}/{name}/git/commits/{head}",
-            headers={"Authorization": f"Bearer {token}", "User-Agent": "autopoiesis"})))
-        if remote.get("sha") != head:
-            raise RuntimeError("pushed head not found on remote")
-        body = pr_body(cfg, job)
-        req = urllib.request.Request(f"https://api.github.com/repos/{org}/{name}/pulls",
-                                     data=json.dumps({"title": f"redteam {job.job_id}: {job.cut} "
-                                                               f"({sum(len(r['accepted']) for r in merged)} findings fixed)",
-                                                      "head": st["branch"], "base": cfg.base_branch, "body": body}).encode(),
-                                     headers={"Authorization": f"Bearer {token}", "User-Agent": "autopoiesis",
-                                              "Content-Type": "application/json"}, method="POST")
-        pr = json.load(urllib.request.urlopen(req))
+        api = f"https://api.github.com/repos/{org}/{name}"
+        _push(job, org, name, token, head, st["branch"])
+        st["pushed_head"] = head; _save(job, st)     # a retry after a failed API call knows the push happened
+        try:
+            remote = _github(f"{api}/git/commits/{head}", token, cfg.api_timeout)
+            if remote.get("sha") != head:
+                raise RuntimeError("pushed head not found on remote")
+            title = f"redteam {job.job_id}: {job.cut} ({sum(len(r['accepted']) for r in merged)} findings fixed)"
+            try:
+                pr = _github(f"{api}/pulls", token, cfg.api_timeout,
+                             {"title": title, "head": st["branch"], "base": cfg.base_branch, "body": pr_body(cfg, job)})
+            except urllib.error.HTTPError as exc:
+                if exc.code != 422:
+                    raise
+                # 422: most likely an earlier POST succeeded and its response was lost; adopt that PR
+                existing = _github(f"{api}/pulls?state=open&head={org}:{st['branch']}", token, cfg.api_timeout)
+                if not existing:
+                    raise
+                pr = existing[0]
+        except RuntimeError:
+            raise
+        except Exception as exc:                     # nothing below the API helper may surface the token
+            raise RuntimeError("GitHub API call failed: " + _scrub(f"{type(exc).__name__}: {exc}", secrets)) from None
         result["pr"] = pr["html_url"]
+    last = st["rounds"][-1] if st["rounds"] else {}
+    result["unreviewed_high_fix"] = bool(last.get("fix") == "merged" and last.get("highs", 0) > 0)
     st["status"] = "closed_pr" if result["pr"] else "closed"
     st["closed_at"] = int(time.time()); st["final_head"] = head; st["pr"] = result["pr"]
     _save(job, st)
     seq = _receipt(cfg, "redteam.job_closed", {"job_id": job.job_id, "cut": job.cut, "rounds": len(st["rounds"]),
                                                "merged_rounds": len(merged), "final_head": head,
-                                               "pr": result["pr"] or "none"})
+                                               "pr": result["pr"] or "none",
+                                               "unreviewed_high_fix": int(result["unreviewed_high_fix"])})
     result["receipt"] = seq
-    for wt in ("review", "fix", "integration"):   # the branch ref stays in the target repo; the worktrees are scratch
-        p = Path(job.path) / wt
-        if p.is_dir():
-            _git(job.repo, "worktree", "remove", "--force", str(p), check=False)
+    if seq is not None:
+        st["close_receipt"] = seq; st.setdefault("receipts", []).append(seq); _save(job, st)
+    _drop_worktrees(job)
     return result
 
 
 def pr_body(cfg: RedTeamConfig, job: Job) -> str:
     st = _load(job)
     lines = [f"Automated red-first review, cut **{job.cut}**, base `{job.base_head[:12]}`. "
-             f"Each finding is a test committed before the fix; the fix was admitted only with the finding tests "
-             f"untouched and green and the suite green with {', '.join(cfg.env_strip)} unset. A human merges.", ""]
+             f"Each finding is a test committed before the fix; a fix was admitted only as a commit that, on a "
+             f"fresh checkout, leaves all finding tests untouched and green and the suite green with "
+             f"{', '.join(cfg.env_strip)} unset, without dropping or skipping a test. Severity is the reviewer's "
+             f"own declaration. A human merges.", ""]
     for r in st["rounds"]:
         lines.append(f"## Round {r['round']} — {len(r['accepted'])} proven, {len(r['rejected'])} refused, "
                      f"{r['highs']} high — fix: {r.get('fix', 'none')}")
         for f in r["accepted"]:
             lines.append(f"- **{f['severity']}** `{cfg.test_dir}/{f['file']}`")
+        changed = (r.get("fix_diff") or {}).get("existing_tests_changed") or []
+        if changed:
+            lines.append(f"\nExisting test files changed by this fix (check that none was weakened): "
+                         + ", ".join(f"`{c}`" for c in changed))
         lines.append(f"\nNotes: `{cfg.notes_dir}/R{r['round']}.md`. Receipts: {st.get('receipts', [])}\n")
+    last = st["rounds"][-1] if st["rounds"] else None
+    if last and last.get("highs", 0) > 0:
+        if last.get("fix") == "merged":
+            why = (f"the round budget (max_rounds={cfg.max_rounds}) is used up" if len(st["rounds"]) >= cfg.max_rounds
+                   else "the job was closed before another round")
+            lines.append(f"**Not re-reviewed:** round {last['round']} proved {last['highs']} high-severity finding(s); "
+                         f"the fix for them was merged without a further review round ({why}). "
+                         f"Review that fix by hand.\n")
+        else:
+            lines.append(f"**Open:** round {last['round']} proved {last['highs']} high-severity finding(s) and no fix "
+                         f"for them was admitted (fix: {last.get('fix', 'none')}); their tests are on this branch "
+                         f"and fail.\n")
     return "\n".join(lines)
 
 
@@ -663,22 +794,27 @@ def cli(argv: List[str], cfg_dict: Dict[str, Any]) -> int:
     s = sub.add_parser("status"); s.add_argument("--job", required=True)
     a = p.parse_args(argv)
     cfg = RedTeamConfig.from_dict(cfg_dict)
-    if a.cmd == "open":
-        job = open_job(cfg, a.job, a.cut)
-        out: Any = {**dataclasses.asdict(job), "reviewer_brief": str(Path(job.path) / "reviewer_brief.md")}
-    else:
-        job = load_job(cfg, a.job)
-        if a.cmd == "gate-findings":
-            out = gate_findings(cfg, job, a.round)
-        elif a.cmd == "open-fix":
-            out = {"fix": open_fix(cfg, job, a.round), "fixer_brief": str(Path(job.path) / f"fixer_brief_r{a.round}.md")}
-        elif a.cmd == "gate-fix":
-            out = gate_fix(cfg, job, a.round)
-        elif a.cmd == "continue":
-            out = {"continue": should_continue(cfg, job)}
-        elif a.cmd == "close":
-            out = close_job(cfg, job, open_pr=not a.no_pr)
+    try:
+        if a.cmd == "open":
+            job = open_job(cfg, a.job, a.cut)
+            out: Any = {**dataclasses.asdict(job), "reviewer_brief": str(Path(job.path) / "reviewer_brief.md")}
         else:
-            out = _load(job)
+            job = load_job(cfg, a.job)
+            if a.cmd == "gate-findings":
+                out = gate_findings(cfg, job, a.round)
+            elif a.cmd == "open-fix":
+                out = {"fix": open_fix(cfg, job, a.round),
+                       "fixer_brief": str(Path(job.path) / f"fixer_brief_r{a.round}.md")}
+            elif a.cmd == "gate-fix":
+                out = gate_fix(cfg, job, a.round)
+            elif a.cmd == "continue":
+                out = {"continue": should_continue(cfg, job)}
+            elif a.cmd == "close":
+                out = close_job(cfg, job, open_pr=not a.no_pr)
+            else:
+                out = _load(job)
+    except RuntimeError as exc:                   # a refusal by the harness itself: one line, no traceback
+        print(json.dumps({"error": str(exc)}, indent=1), file=sys.stderr)
+        return 1
     print(json.dumps(out, indent=1, sort_keys=True))
     return 0
