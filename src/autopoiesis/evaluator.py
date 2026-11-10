@@ -90,6 +90,8 @@ class SubprocessFitnessEvaluator(FitnessEvaluator):
 
         # 1. Run Golden Test Suite
         t0 = time.time()
+        golden_stdout = ""
+        golden_error: Optional[str] = None      # why the command produced no exit code (timeout, cannot start)
         try:
             res_golden = subprocess.run(
                 golden_cmd,
@@ -102,9 +104,18 @@ class SubprocessFitnessEvaluator(FitnessEvaluator):
             )
             golden_passed = 1 if res_golden.returncode == 0 else 0
             golden_failed = 0 if res_golden.returncode == 0 else 1
-        except Exception:
+            golden_stdout = res_golden.stdout or ""
+        except subprocess.TimeoutExpired as exc:
+            # a suite that does not finish is a failed candidate, reported as such
             golden_passed = 0
             golden_failed = 1
+            partial = exc.stdout or ""
+            golden_stdout = partial.decode("utf-8", "replace") if isinstance(partial, bytes) else partial
+            golden_error = f"timeout after {self.timeout_seconds}s"
+        except Exception as exc:
+            golden_passed = 0
+            golden_failed = 1
+            golden_error = f"{type(exc).__name__}: {exc}"
 
         latency_ms = (time.time() - t0) * 1000.0
 
@@ -144,7 +155,8 @@ class SubprocessFitnessEvaluator(FitnessEvaluator):
             opsec_passed=True,
             audit_chain_valid=True,
             details={
-                "golden_stdout": res_golden.stdout if total_golden > 0 else "",
+                "golden_stdout": golden_stdout,
+                "golden_error": golden_error,
                 "noop_mutation": noop_mutation,
                 "trivial_challenge": trivial_challenge,
             },

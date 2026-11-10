@@ -26,6 +26,9 @@ redteam:
   jobs_root: "/opt/data/cache/scratch/redteam-jobs"
   rotation_path: "/opt/data/runtime/autopoiesis/redteam_rotation.json"
   ledger_path: "/opt/data/runtime/argus/audit.jsonl"
+  # Where the argus_ledger package lives when it is not installed in the interpreter that runs autopoiesis.
+  # The environment variable AUTOPOIESIS_ARGUS_SRC does the same; without either, a missing package is an error.
+  argus_src: "/opt/data/work/telarch-suite/argus/src"
   gh_token_cmd: "python3 /opt/data/scripts/get_gh_token.py"
   max_rounds: 2
   env_strip: ["KIBISIS_PASSPHRASE", "KIBISIS_PASSPHRASE_FILE", "KIBISIS_SRC", "CI"]

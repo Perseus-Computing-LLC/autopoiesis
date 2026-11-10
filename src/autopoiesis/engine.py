@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from autopoiesis.config import AutopoiesisConfig
 from autopoiesis.curriculum import CurriculumGenerator, RedFirstCurriculumGenerator
-from autopoiesis.deployment import DeploymentManager, GitPromotionManager
+from autopoiesis.deployment import DeploymentManager, GitPromotionManager, PromotionError
 from autopoiesis.evaluator import FitnessEvaluator, SubprocessFitnessEvaluator
 from autopoiesis.gate import ParetoGate
 from autopoiesis.models import FailureCluster, MutationProposal, ParetoVerdict, PromotionReceipt
@@ -32,6 +32,7 @@ class AutopoiesisEngine:
         pareto_gate: ParetoGate,
         deployment_manager: DeploymentManager,
         enforce_red_first: bool = False,
+        auto_merge: bool = True,
     ):
         self.telemetry_source = telemetry_source
         self.cluster_engine = cluster_engine
@@ -42,6 +43,8 @@ class AutopoiesisEngine:
         self.pareto_gate = pareto_gate
         self.deployment_manager = deployment_manager
         self.enforce_red_first = enforce_red_first
+        # False: evaluate and report, never call the deployment manager (config: deployment.auto_merge)
+        self.auto_merge = auto_merge
 
     @classmethod
     def from_config(
@@ -90,6 +93,7 @@ class AutopoiesisEngine:
             pareto_gate=pareto_gate,
             deployment_manager=deployment_manager,
             enforce_red_first=config.evaluation.enforce_red_first,
+            auto_merge=config.deployment.auto_merge,
         )
 
     def run_cycle(self, dry_run: bool = False) -> Dict[str, Any]:
@@ -171,8 +175,17 @@ class AutopoiesisEngine:
             }
 
             # 6. PROMOTE & DISTILL: If Pareto-dominant, merge and distill prompt rules
-            if verdict.is_pareto_dominant and not dry_run:
-                receipt = self.deployment_manager.promote_mutation(proposal, verdict)
+            if verdict.is_pareto_dominant and not dry_run and not self.auto_merge:
+                # the operator's configuration says: do not merge. The candidate is reported, not promoted.
+                report["status"] = "dominant_not_merged"
+                report["promotion_skipped"] = "deployment.auto_merge is false"
+            elif verdict.is_pareto_dominant and not dry_run:
+                try:
+                    receipt = self.deployment_manager.promote_mutation(proposal, verdict)
+                except PromotionError as exc:
+                    report["status"] = "promotion_failed"
+                    report["promotion_error"] = str(exc)
+                    return report
                 report["status"] = "promoted"
                 report["promoted"] = True
                 report["receipt"] = {

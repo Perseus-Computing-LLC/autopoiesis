@@ -14,20 +14,39 @@ from typing import Any, Dict, List, Optional
 
 from autopoiesis.models import MutationProposal, ParetoVerdict, PromotionReceipt
 
-# Optional integration with Argus append-only audit ledger
-ARGUS_AVAILABLE = False
-try:
-    import argus_ledger  # type: ignore
-    ARGUS_AVAILABLE = True
-except ImportError:
-    argus_src = Path("/opt/data/work/telarch-suite/argus/src")
-    if argus_src.is_dir():
-        sys.path.insert(0, str(argus_src))
-        try:
-            import argus_ledger  # type: ignore
-            ARGUS_AVAILABLE = True
-        except ImportError:
-            ARGUS_AVAILABLE = False
+# Optional integration with Argus append-only audit ledger. The package is used when it is installed, or when
+# its source directory is named explicitly (GitPromotionManager(argus_src=...) or AUTOPOIESIS_ARGUS_SRC).
+# No location is built in.
+ARGUS_SRC_ENV = "AUTOPOIESIS_ARGUS_SRC"
+
+
+def _argus_importable(argus_src: Optional[Path] = None) -> bool:
+    try:
+        import argus_ledger  # type: ignore  # noqa: F401
+        return True
+    except ImportError:
+        pass
+    src = argus_src or os.environ.get(ARGUS_SRC_ENV)
+    if not src or not Path(src).is_dir():
+        return False
+    if str(src) not in sys.path:
+        sys.path.insert(0, str(src))
+    try:
+        import argus_ledger  # type: ignore  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+ARGUS_AVAILABLE = _argus_importable()
+
+
+class PromotionError(RuntimeError):
+    """The candidate was not put on the release branch. Nothing was attested."""
+
+
+def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True)
 
 
 class DeploymentManager(abc.ABC):
@@ -48,10 +67,12 @@ class GitPromotionManager(DeploymentManager):
         repo_path: Path,
         release_branch: str = "main",
         ledger_path: Optional[Path] = None,
+        argus_src: Optional[Path] = None,
     ):
         self.repo_path = Path(repo_path).resolve()
         self.release_branch = release_branch
         self.ledger_path = Path(ledger_path).resolve() if ledger_path else None
+        self.argus_src = Path(argus_src) if argus_src else None
 
     def _record_attestation(
         self,
@@ -65,7 +86,7 @@ class GitPromotionManager(DeploymentManager):
         seq: Optional[int] = None
         event_hash: Optional[str] = None
 
-        if self.ledger_path and ARGUS_AVAILABLE and self.ledger_path.parent.exists():
+        if self.ledger_path and self.ledger_path.parent.exists() and _argus_importable(self.argus_src):
             try:
                 from argus_ledger.ledger import AppendOnlyLedger  # type: ignore
 
@@ -119,35 +140,83 @@ class GitPromotionManager(DeploymentManager):
 
         return seq
 
+    def _release_ref(self) -> str:
+        return f"refs/heads/{self.release_branch}"
+
+    def _release_tip(self) -> Optional[str]:
+        res = _git(self.repo_path, "rev-parse", "-q", "--verify", f"{self._release_ref()}^{{commit}}")
+        return res.stdout.strip() if res.returncode == 0 else None
+
+    def _worktree_on_release_branch(self) -> Optional[Path]:
+        """The worktree that has the release branch checked out, if any."""
+        res = _git(self.repo_path, "worktree", "list", "--porcelain")
+        if res.returncode != 0:
+            raise PromotionError(f"cannot list worktrees: {res.stderr.strip()[-300:]}")
+        current: Optional[Path] = None
+        for line in res.stdout.splitlines():
+            if line.startswith("worktree "):
+                current = Path(line[len("worktree "):])
+            elif line == f"branch {self._release_ref()}":
+                return current
+        return None
+
+    def _advance_release_branch(self, old_tip: str, commit_sha: str) -> None:
+        """Fast-forward the configured release branch to `commit_sha`, or raise PromotionError.
+
+        The branch that moves is `release_branch`, whatever is checked out in `repo_path`. Where the release
+        branch is checked out, the fast-forward is done there so that its files follow; where it is not checked
+        out anywhere, the ref is moved with a compare-and-swap against the tip seen before.
+        """
+        if _git(self.repo_path, "merge-base", "--is-ancestor", old_tip, commit_sha).returncode != 0:
+            raise PromotionError(
+                f"{self.release_branch} ({old_tip[:8]}) is not an ancestor of the candidate {commit_sha[:8]}: "
+                f"not a fast-forward")
+        holder = self._worktree_on_release_branch()
+        if holder is not None:
+            res = _git(holder, "merge", "--ff-only", commit_sha)
+            how = f"git merge --ff-only in {holder}"
+        else:
+            res = _git(self.repo_path, "update-ref", "-m", f"autopoiesis: promote {commit_sha[:8]}",
+                       self._release_ref(), commit_sha, old_tip)
+            how = "git update-ref"
+        if res.returncode != 0:
+            raise PromotionError(f"{how} failed (exit {res.returncode}): {(res.stderr or res.stdout).strip()[-400:]}")
+        if self._release_tip() != commit_sha:
+            raise PromotionError(f"after {how}, {self.release_branch} does not point at {commit_sha[:8]}")
+
     def promote_mutation(
         self, mutation: MutationProposal, verdict: ParetoVerdict
     ) -> PromotionReceipt:
+        """Commit the candidate, fast-forward the release branch to it, then attest.
+
+        Raises PromotionError when the commit is not on the release branch afterwards; in that case no ledger
+        event, no attestation card and no receipt exist.
+        """
         if not verdict.is_pareto_dominant:
             raise ValueError(f"Cannot promote non-dominant candidate {mutation.proposal_id}")
 
         worktree = Path(mutation.worktree_path)
+        old_tip = self._release_tip()
+        if old_tip is None:
+            raise PromotionError(f"release branch {self.release_branch!r} does not exist in {self.repo_path}")
 
         # 1. Commit in worktree
-        subprocess.run(["git", "-C", str(worktree), "add", "-A"], check=True)
         commit_msg = (
             f"chore(autopoiesis): autogenous promotion of {mutation.proposal_id}\n\n"
             f"Remediates failure cluster {mutation.cluster_id}.\n"
             f"Pareto verdict: zero_regression={verdict.zero_regression}, "
             f"defect_eliminated={verdict.defect_eliminated}."
         )
-        subprocess.run(["git", "-C", str(worktree), "commit", "-m", commit_msg], check=True)
+        for step in (("add", "-A"), ("commit", "-m", commit_msg), ("rev-parse", "HEAD")):
+            res = _git(worktree, *step)
+            if res.returncode != 0:
+                raise PromotionError(
+                    f"git {step[0]} failed in the candidate worktree (exit {res.returncode}): "
+                    f"{(res.stderr or res.stdout).strip()[-400:]}")
+        commit_sha = res.stdout.strip()
 
-        rev_res = subprocess.run(
-            ["git", "-C", str(worktree), "rev-parse", "HEAD"],
-            capture_output=True, text=True, check=True
-        )
-        commit_sha = rev_res.stdout.strip()
-
-        # 2. Merge to release branch
-        subprocess.run(
-            ["git", "-C", str(self.repo_path), "merge", "--ff-only", commit_sha],
-            capture_output=True, text=True
-        )
+        # 2. Fast-forward the release branch; anything short of that is not a promotion
+        self._advance_release_branch(old_tip, commit_sha)
 
         now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
         release_id = f"rel_{commit_sha[:8]}"

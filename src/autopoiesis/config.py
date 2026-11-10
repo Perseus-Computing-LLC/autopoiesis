@@ -40,6 +40,19 @@ class EvaluationConfig:
     enforce_red_first: bool = True
 
 
+def _flag(value: Any, key: str) -> bool:
+    """A boolean setting. `bool("false")` is True, so strings are read by meaning and anything else is refused."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in ("true", "yes", "on", "1"):
+        return True
+    if isinstance(value, str) and value.strip().lower() in ("false", "no", "off", "0"):
+        return False
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    raise ValueError(f"{key} must be true or false, got {value!r}")
+
+
 @dataclasses.dataclass
 class DeploymentConfig:
     branch: str = "main"
@@ -82,11 +95,11 @@ class AutopoiesisConfig:
                 test_command=eval_data.get("test_command", "pytest -q"),
                 max_latency_degradation_pct=float(eval_data.get("max_latency_degradation_pct", 2.0)),
                 prompt_token_dividend=int(eval_data.get("prompt_token_dividend", 35)),
-                enforce_red_first=bool(eval_data.get("enforce_red_first", True)),
+                enforce_red_first=_flag(eval_data.get("enforce_red_first", True), "evaluation.enforce_red_first"),
             ),
             deployment=DeploymentConfig(
                 branch=deploy_data.get("branch", "main"),
-                auto_merge=bool(deploy_data.get("auto_merge", True)),
+                auto_merge=_flag(deploy_data.get("auto_merge", True), "deployment.auto_merge"),
             ),
         )
 
