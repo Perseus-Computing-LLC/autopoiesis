@@ -64,23 +64,41 @@ As identified across literature and empirical sweeps (arXiv:2609.24972, arXiv:26
 
 ## 3. The 5 Evolutionary Stages
 
+> **Design versus code.** This section describes the intended architecture. Each stage ends with an
+> *Implemented in 0.1.0* note that says what the code in `src/autopoiesis/` does today; where the two differ,
+> the note is the accurate one.
+
 ### Stage 1: Telemetry & Fitness Sensing
 * **Pluggable Ingestion**: Reads structured execution traces from immutable audit ledgers (Argus), OpenTelemetry, or JSONL logs.
 * **Failure & Latency Clustering**: Clusters events by tool, failure class, and semantic error template.
 * **Statistical Defect Tracking**: Computes baseline error rates and Wilson confidence intervals for each cluster.
 
+*Implemented in 0.1.0:* `JsonlTelemetrySource` and `ArgusTelemetrySource` only; there is no OpenTelemetry reader.
+Events are clustered by tool and normalized error template, with a transient/deterministic flag. The per-cluster
+figure is a plain ratio; no confidence interval is computed.
+
 ### Stage 2: Hypothesis & Mutation Engine
-* **Isolation Guarantee**: All mutations occur in ephemeral, sandboxed Git worktrees (`/opt/data/kanban/workspaces/...`).
+* **Isolation Guarantee**: All mutations occur in ephemeral, sandboxed Git worktrees (under `<repo>/<mutation.sandbox_dir>`, by default `<repo>/.autopoiesis/sandboxes`).
 * **Multi-Tier Mutation**:
   1. *Defensive Wrapping*: Automatic input normalization, path resolution, and resilient retry logic.
   2. *Algorithmic Replacement*: Refactoring slow or fragile pure-Python routines into optimized implementations or native extensions.
   3. *Interface Hardening*: Upgrading tool schemas and contracts to eliminate ambiguity.
 * **Proposer Memory**: Tracks mutation history and rejected hypotheses to prevent cyclical repairs.
 
+*Implemented in 0.1.0:* `WorktreeManager` (in `mutation.py`) creates and removes the worktree and its branch.
+`PatchApplicatorMutationEngine` runs a caller-supplied `mutator_fn(cluster, sandbox_path)` and records the
+resulting diff; without one it proposes no change. None of the three mutation tiers is built in, and no mutation
+history is kept.
+
 ### Stage 3: Synthetic Curriculum & Challenge Generation
 * **Metamorphic Testing**: Generates test cases that assert invariant properties across varied inputs (e.g., path traversal edge cases, unicode paths, concurrency deadlocks).
 * **Adversarial Fuzzing**: Automatically creates property-based test suites targeting the modified module.
 * **Stress Benchmarks**: Measures execution latency, memory allocation, and CPU throughput under load.
+
+*Implemented in 0.1.0:* none of the three. A curriculum generator writes one pytest file per cluster: a
+caller-supplied synthesizer's output, or a placeholder (`RedFirstCurriculumGenerator`: a test that cannot pass;
+`FileBasedCurriculumGenerator`: `assert True`). With `enforce_red_first` the engine checks that the file fails on
+the unpatched head before mutating. No benchmark is run (`benchmark_cmd` is stored and unused).
 
 ### Stage 4: Multi-Objective Pareto Selection Gate
 A candidate mutation $C$ is rejected if it fails any dimension of the Pareto gate:
@@ -88,6 +106,14 @@ A candidate mutation $C$ is rejected if it fails any dimension of the Pareto gat
 2. **Defect Elimination ($M_2$)**: Statistically significant drop in target defect frequency on both synthetic challenge suites and historical replay buffers.
 3. **Performance Envelope ($M_3$)**: Wall-clock latency and resident memory within noise threshold ($\le 2\%$ delta) or strictly superior.
 4. **OpSec & Invariant Safety ($M_4$)**: Zero secret leakage, clean cryptographic hash chain continuity in Argus, and compliance with outbound gates.
+
+*Implemented in 0.1.0:* $M_1$ is one run of the configured test command (a shell command; exit 0 = pass; a
+timeout is a failure); nothing runs `cargo test` unless that is the command. $M_2$ is: the challenge file passes,
+is not trivial (a test made only of `assert True` / `pass`) and the mutation is not empty; there is no statistics
+and no replay buffer. $M_3$: the wall-clock time of the test command is recorded, but the engine supplies no
+baseline, so the latency comparison never runs; the memory figure is a constant. $M_4$: both flags are constants
+(`True`); no secret scan and no hash-chain check is performed. A mutation kill score, when a caller supplies one,
+is compared with `min_mutation_kill_score` (default 0.0); the engine does not compute it.
 
 ### Stage 5: Autogenous Promotion & Prompt Distillation
 * **Self-Hosting Promotion**:
@@ -98,6 +124,20 @@ A candidate mutation $C$ is rejected if it fails any dimension of the Pareto gat
 * **The Distillation Dividend**:
   - The corresponding temporary invariant in Harpe/Kibisis is marked as `graduated_to_code` and permanently removed from prompt assembly.
   - Context tokens are immediately reclaimed for reasoning and user domain context.
+
+*Implemented in 0.1.0:* promotion happens only when `deployment.auto_merge` is true and the cycle is not a dry
+run. `GitPromotionManager` commits the candidate in its worktree and fast-forwards the configured release branch
+to that commit SHA (in the worktree that has the branch checked out, otherwise by a compare-and-swap ref update);
+if that is not possible it raises `PromotionError` and writes nothing. After a successful fast-forward it appends
+an unsigned event to the Argus ledger when a ledger path was given and `argus_ledger` is importable, and writes a
+JSON card under `.autopoiesis/attestations/`; a failure of either write is ignored. Nothing is rebuilt,
+installed, restarted or hot-swapped. No invariant is marked or removed in Harpe/Kibisis: the receipt carries the
+label `invariant.<cluster id>` and a fixed token estimate.
+
+### Separate from the five stages: the red-first review loop (`redteam.py`)
+`autopoiesis redteam` implements the gates of an adversarial review loop between two untrusted agents (a
+reviewer writing failing tests, a fixer making them pass). It is not part of `AutopoiesisEngine.run_cycle()`.
+Its module docstring states what each gate checks and what it does not establish; the README has a summary.
 
 ---
 

@@ -41,11 +41,17 @@ Autopoiesis eliminates these pathologies through an integrated framework of **Re
 
 ### Version 0.1.0 — Foundational Frame & Sandboxing (Completed)
 - **Telemetry Ingestion & Clustering (`telemetry.py`):** Ingestion of JSONL and Argus audit logs with integer, hex, and string normalization.
-- **Git Worktree Isolation (`deployment.py`):** Ephemeral sandboxed evaluation branches (`autopoiesis-eval-<cluster>`).
-- **Subprocess Test Execution & Gating (`evaluator.py`, `gate.py`):** Baseline and challenge test execution against `ParetoGate` (latency, regression, and correctness).
+- **Git Worktree Isolation (`mutation.py`, `WorktreeManager`):** Ephemeral sandboxed evaluation branches (`autopoiesis-eval-<cluster>`).
+- **Subprocess Test Execution & Gating (`evaluator.py`, `gate.py`):** Existing-suite and challenge test execution against `ParetoGate` (regression and correctness). The gate has a latency comparison, but the engine measures no baseline, so it does not run in a cycle (not completed).
 - **Hardened Invariants (`0ce2276`):**
-  - Hard rejection in `ParetoGate` and `GitPromotionManager` if candidate patch diff is empty or challenge test AST contains only trivial `assert True`.
+  - Hard rejection in `ParetoGate` if the candidate patch diff is empty or the challenge test consists only of `assert True` / `pass` (other constant assertions such as `assert 1` are not detected). `GitPromotionManager` itself checks only that the verdict is Pareto-dominant.
   - Automated teardown and cleanup of ephemeral worktrees and evaluation branches upon exit.
+
+---
+
+### Shipped outside the version plan: red-first review loop (`redteam.py`, `autopoiesis redteam`)
+- The gates of an adversarial review loop between an untrusted reviewer and an untrusted fixer: findings admitted only when they fail on a clean checkout of the head, fixes admitted only as a commit that keeps all evidence byte-identical and green and the suite green without dropping tests; push and pull request at the end. See the README section "Red-first review loop".
+- Naming: `redteam.py` and the CLI help call this loop "AP-3". That is a different thing from the roadmap item "AP-3: Deterministic Red-First Challenge Synthesis" below, which is about `curriculum.py`.
 
 ---
 
@@ -64,6 +70,14 @@ Autopoiesis eliminates these pathologies through an integrated framework of **Re
 ---
 
 ### Version 0.3.0 — Mathematical Anti-Overfitting & Formal Guardrails (Sprint 3)
+
+> **State of the code for this sprint (planned work, partly present as unwired modules):**
+> `localization.py` computes Ochiai scores per source *line*, not per basic block, and `AutopoiesisEngine` does
+> not call it. `mutation_test.py` (`DifferentialMutationTester`) swaps arithmetic and comparison operators and
+> shifts numeric/boolean constants on the changed lines; it does not delete statements, so a changed line with
+> none of those gets no mutant. Its result says `measured: False` (score 0.0, with a reason) when the tests do
+> not pass before mutation or no mutant exists. The engine and the evaluator do not run it, and `ParetoGate`'s
+> `min_mutation_kill_score` defaults to 0.0, so no kill score is enforced today. The items below are the goal.
 - **Sub-Second Spectrum-Based Fault Localization (Ochiai SBFL):**
   - Profile test coverage across passing vs. failing challenge executions.
   - Compute the Ochiai coefficient for every basic block:
@@ -91,6 +105,12 @@ Autopoiesis eliminates these pathologies through an integrated framework of **Re
 ---
 
 ## 3. Verification & Acceptance Criteria
+
+These are targets for the end of the plan, not statements about 0.1.0. Today: (1) is enforced for empty diffs and
+`assert True` challenges only; (2) is not measured in a cycle; (3) is not measured; (4) receipts are unsigned and
+are written after the fast-forward of the release branch (never for a promotion that did not happen), and a
+ledger or card write that fails is ignored. CI (`.github/workflows/ci.yml`) runs the test suite on push and pull
+request; promotion does not wait for it.
 
 1. **Zero Overfitting:** 0% promotion of trivial branch-avoidance or empty-diff mutations.
 2. **Zero Hallucinated Lines:** 100% Mutation Kill Score verified across all lines in promoted diffs.

@@ -6,11 +6,17 @@ if the finding tests go green and the suite stays green, and the next round star
 
 This module holds the parts that must not be left to an agent's self-report:
 
-* `open_job`      isolated worktrees from the target's head; cut chosen by rotation; briefs written.
-* `gate_findings` a finding test is admitted only if it FAILS on the unpatched head (pytest rc 1); a test that
-                  passes (rc 0) or does not run (rc >= 2) is refused. Admitted evidence is committed on the
-                  integration branch before any fixer is briefed.
-* `open_fix`      the fixer's branch, from the integration head.
+* `open_job`      isolated worktrees from the target's head; cut chosen by rotation; briefs written. All or
+                  nothing: a failed open removes what it created and uses up no cut.
+* `gate_findings` each candidate file is read once and run ALONE in a fresh checkout of the recorded head, never
+                  in the reviewer's worktree. It is admitted only if it fails there by assertion (pytest rc 1),
+                  imports the code under review and is not made of constant assertions; a file that passes,
+                  does not run, or fails for want of a package is refused. The bytes that were run are the bytes
+                  committed as evidence on the integration branch, before any fixer is briefed. Rounds are
+                  gated once each, in order, within `max_rounds`, and only after the previous round's fix
+                  merged. The round is written to job.json together with the commit; an interrupted or failed
+                  commit is undone or completed on the next call.
+* `open_fix`      the fixer's branch, from the evidence commit.
 * `gate_fix`      judges the COMMIT at the tip of the fix branch, checked out fresh from git objects (never the
                   fixer's working directory): the evidence of every round so far must be byte-identical to
                   what was committed and must pass; the whole suite must pass with the configured environment
