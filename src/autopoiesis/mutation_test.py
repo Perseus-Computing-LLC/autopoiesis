@@ -26,11 +26,31 @@ class Mutant:
 
 @dataclasses.dataclass
 class MutationKillResult:
+    """Outcome of differential mutation testing.
+
+    `measured` is False when no score could be established: the tests did not pass on the unmutated code, or no
+    mutant could be generated for the changed lines. `reason` then says which, and `mutation_kill_score` is 0.0
+    (never 1.0): an unmeasured patch must not read as a fully covered one, and a gate with a minimum kill score
+    refuses it. With `measured` True the score is killed / total over real, non-identical mutants.
+    """
+
     total_mutants: int
     killed_mutants: int
     survived_mutants: int
     mutation_kill_score: float
     mutants: List[Mutant]
+    measured: bool = True
+    reason: str = ""
+
+
+def _not_measured(reason: str) -> MutationKillResult:
+    return MutationKillResult(total_mutants=0, killed_mutants=0, survived_mutants=0, mutation_kill_score=0.0,
+                              mutants=[], measured=False, reason=reason)
+
+
+def _position(node: ast.AST) -> Tuple:
+    return (type(node), getattr(node, "lineno", None), getattr(node, "col_offset", None),
+            getattr(node, "end_lineno", None), getattr(node, "end_col_offset", None))
 
 
 class ASTMutator(ast.NodeTransformer):
@@ -96,15 +116,20 @@ class ASTMutator(ast.NodeTransformer):
 
 
 class SingleNodeReplacer(ast.NodeTransformer):
-    """Replaces exactly one target AST node with a mutated counterpart."""
+    """Replaces exactly the node the mutant was derived from, identified by type and source span.
+
+    Several nodes of one type can share a line (`x * 2 + 1` has two BinOps and two constants); the line number
+    alone picks the first of them, which may not be the one that was mutated.
+    """
 
     def __init__(self, target_lineno: int, replacement_node: ast.AST):
         self.target_lineno = target_lineno
         self.replacement_node = replacement_node
+        self.target = _position(replacement_node)       # the mutant is a copy: it carries the original's span
         self.replaced = False
 
     def visit(self, node: ast.AST):
-        if not self.replaced and getattr(node, "lineno", None) == self.target_lineno and type(node) == type(self.replacement_node):
+        if not self.replaced and _position(node) == self.target:
             self.replaced = True
             return self.replacement_node
         return self.generic_visit(node)
@@ -154,6 +179,10 @@ class DifferentialMutationTester:
 
     def run_tests(self, timeout_seconds: int = 45) -> bool:
         """Run test command in sandbox. Returns True if tests pass (exit 0)."""
+        env = os.environ.copy()
+        # no bytecode cache: a mutant has the size of the original and may be written within the same second,
+        # which is all a cached .pyc is checked against
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
         res = subprocess.run(
             self.test_command,
             shell=True,
@@ -161,10 +190,19 @@ class DifferentialMutationTester:
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
+            env=env,
         )
         return res.returncode == 0
 
     def evaluate(self, target_files: List[str], max_mutants: int = 50) -> MutationKillResult:
+        # A mutant is "killed" when the tests fail on it. That only means something if they pass without it.
+        try:
+            baseline_green = self.run_tests()
+        except subprocess.TimeoutExpired:
+            return _not_measured("the tests timed out on the unmutated code")
+        if not baseline_green:
+            return _not_measured("the tests do not pass on the unmutated code")
+
         diff_lines = self.get_diff_lines(target_files)
         all_mutants: List[Mutant] = []
 
@@ -177,6 +215,7 @@ class DifferentialMutationTester:
                 tree = ast.parse(orig_source, filename=str(file_path))
             except SyntaxError:
                 continue
+            orig_unparsed = ast.unparse(tree)
 
             collector = ASTMutator(lines)
             collector.visit(tree)
@@ -193,6 +232,8 @@ class DifferentialMutationTester:
                     mutated_code = ast.unparse(mutated_tree)
                 except Exception:
                     continue
+                if not replacer.replaced or mutated_code == orig_unparsed:
+                    continue                                # not a mutant: the program is unchanged
 
                 all_mutants.append(
                     Mutant(
@@ -206,14 +247,9 @@ class DifferentialMutationTester:
                 )
 
         if not all_mutants:
-            # Zero mutants generated on delta lines -> trivial / no-op
-            return MutationKillResult(
-                total_mutants=0,
-                killed_mutants=0,
-                survived_mutants=0,
-                mutation_kill_score=1.0,
-                mutants=[],
-            )
+            # Nothing was challenged (no arithmetic/comparison operator or numeric/boolean constant on the
+            # changed lines, or no changed Python file): that is "unknown", not "every mutant killed".
+            return _not_measured("no mutant could be generated for the changed lines")
 
         killed_count = 0
         survived_count = 0
@@ -229,9 +265,10 @@ class DifferentialMutationTester:
                 else:
                     mutant.killed = False
                     survived_count += 1
-            except Exception as e:
-                # If test execution crashed or timed out, mutant is killed
+            except subprocess.TimeoutExpired:
+                # the tests passed in time without the mutant (baseline above), so not finishing is its doing
                 mutant.killed = True
+                mutant.killer_test_output = "timeout"
                 killed_count += 1
             finally:
                 # Restore original source
