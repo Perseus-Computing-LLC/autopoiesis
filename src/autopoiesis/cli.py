@@ -192,8 +192,14 @@ deployment:
                 print(f"  Release ID: {receipt.get('release_id')}")
                 print(f"  Commit SHA: {receipt.get('commit_sha')}")
                 print(f"  Tokens Reclaimed: {report.get('reclaimed_tokens')}")
+            if report.get("promotion_skipped"):
+                print(f"NOT PROMOTED: {report['promotion_skipped']}")
+            if report.get("promotion_error"):
+                print(f"PROMOTION FAILED: {report['promotion_error']}")
             print("==================================================")
-        return 0 if (report.get("promoted") or args.dry_run or report.get("status") in ("no_clusters", "dry_run_evaluated")) else 1
+        # "dominant_not_merged": the cycle did what the configuration asked (deployment.auto_merge: false)
+        ok_statuses = ("no_clusters", "dry_run_evaluated", "dominant_not_merged")
+        return 0 if (report.get("promoted") or args.dry_run or report.get("status") in ok_statuses) else 1
 
     return 0
 
