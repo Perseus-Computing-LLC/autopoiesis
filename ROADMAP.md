@@ -2,7 +2,7 @@
 
 **Repository:** `Perseus-Computing-LLC/autopoiesis`  
 **License:** MIT  
-**Current Baseline:** `0.1.0` (`0ce2276`)
+**Current Baseline:** `0.1.0` (code as of `d0ea15c`, 2026-11-10)
 
 ---
 
